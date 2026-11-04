@@ -1,4 +1,4 @@
-import type { EntityType, RedactionEntity, ScanConfig } from './types';
+import type { CustomRule, CustomRuleType, EntityType, RedactionEntity, ScanConfig } from './types';
 
 export const DEFAULT_ENABLED_TYPES: EntityType[] = [
 	'PER',
@@ -10,7 +10,8 @@ export const DEFAULT_ENABLED_TYPES: EntityType[] = [
 	'CREDIT_CARD',
 	'SUSPECTED_TOKEN',
 	'AMBIGUOUS_PER',
-	'AMBIGUOUS_ORG'
+	'AMBIGUOUS_ORG',
+	'CUSTOM_RULE'
 ];
 
 export const REDACTION_LABELS: Record<EntityType, string> = {
@@ -23,7 +24,8 @@ export const REDACTION_LABELS: Record<EntityType, string> = {
 	TOKEN: '[TOKEN]',
 	SUSPECTED_TOKEN: '[TOKEN]',
 	IP: '[IP]',
-	CREDIT_CARD: '[CREDIT_CARD]'
+	CREDIT_CARD: '[CREDIT_CARD]',
+	CUSTOM_RULE: '[CUSTOM]'
 };
 
 const ENTITY_TYPE_TO_ENUM: Record<EntityType, number> = {
@@ -36,7 +38,8 @@ const ENTITY_TYPE_TO_ENUM: Record<EntityType, number> = {
 	CREDIT_CARD: 7,
 	SUSPECTED_TOKEN: 8,
 	AMBIGUOUS_PER: 9,
-	AMBIGUOUS_ORG: 10
+	AMBIGUOUS_ORG: 10,
+	CUSTOM_RULE: 11
 };
 
 const ENUM_TO_ENTITY_TYPE: Record<number, EntityType> = {
@@ -49,7 +52,8 @@ const ENUM_TO_ENTITY_TYPE: Record<number, EntityType> = {
 	7: 'CREDIT_CARD',
 	8: 'SUSPECTED_TOKEN',
 	9: 'AMBIGUOUS_PER',
-	10: 'AMBIGUOUS_ORG'
+	10: 'AMBIGUOUS_ORG',
+	11: 'CUSTOM_RULE'
 };
 
 const AMBIGUOUS_PROPER_NOUNS = new Set([
@@ -78,6 +82,320 @@ const AMBIGUOUS_PROPER_NOUNS = new Set([
 ]);
 
 const WORD_CHAR_REGEX = /[\p{L}\p{N}_]/u;
+
+/**
+ * Validate custom rule value & guard against ReDoS (catastrophic backtracking) in REGEX rules.
+ */
+export interface RuleValidationResult {
+	valid: boolean;
+	error?: string;
+}
+
+// Detects nested quantifiers inside groups such as (a+)+, (.*)+, ([a-z]*)*, (a+){2,}
+const REDOS_NESTED_QUANTIFIER_REGEX = /\([^()]*[+*?][^()]*\)\s*(?:[+*?]|\{\d+,\d*\})/;
+
+export function validateCustomRule(type: CustomRuleType, value: string): RuleValidationResult {
+	const trimmed = value.trim();
+	if (!trimmed) {
+		return { valid: false, error: 'Rule pattern or phrase cannot be empty.' };
+	}
+
+	if (trimmed.length > 500) {
+		return { valid: false, error: 'Rule value cannot exceed 500 characters.' };
+	}
+
+	if (type === 'REGEX') {
+		if (REDOS_NESTED_QUANTIFIER_REGEX.test(trimmed)) {
+			return {
+				valid: false,
+				error: 'Unsafe regex: nested quantifiers risk catastrophic backtracking (ReDoS).'
+			};
+		}
+		try {
+			new RegExp(trimmed, 'g');
+		} catch (err) {
+			return {
+				valid: false,
+				error: err instanceof Error ? err.message : 'Invalid regular expression syntax.'
+			};
+		}
+	}
+
+	return { valid: true };
+}
+
+interface AutomatonOutput {
+	id: string;
+	type: CustomRuleType;
+	value: string;
+	length: number;
+}
+
+interface TrieNode {
+	children: Map<string, number>;
+	fail: number;
+	outputs: AutomatonOutput[];
+}
+
+/**
+ * Aho-Corasick Automaton for O(N + M + Z) single-pass matching of EXACT and PHRASE custom rules.
+ */
+export class AhoCorasickAutomaton {
+	private nodes: TrieNode[] = [{ children: new Map(), fail: 0, outputs: [] }];
+	private built = false;
+
+	public addPattern(pattern: string, output: AutomatonOutput): void {
+		if (!pattern) return;
+		let current = 0;
+		for (let i = 0; i < pattern.length; i++) {
+			const ch = pattern[i];
+			let next = this.nodes[current].children.get(ch);
+			if (next === undefined) {
+				next = this.nodes.length;
+				this.nodes.push({ children: new Map(), fail: 0, outputs: [] });
+				this.nodes[current].children.set(ch, next);
+			}
+			current = next;
+		}
+		this.nodes[current].outputs.push(output);
+		this.built = false;
+	}
+
+	public buildFailureLinks(): void {
+		const queue: number[] = [];
+		const root = this.nodes[0];
+
+		for (const childIdx of root.children.values()) {
+			this.nodes[childIdx].fail = 0;
+			queue.push(childIdx);
+		}
+
+		let head = 0;
+		while (head < queue.length) {
+			const currentIdx = queue[head++];
+			const currentNode = this.nodes[currentIdx];
+
+			for (const [ch, childIdx] of currentNode.children.entries()) {
+				queue.push(childIdx);
+				let failCandidate = currentNode.fail;
+				while (failCandidate !== 0 && !this.nodes[failCandidate].children.has(ch)) {
+					failCandidate = this.nodes[failCandidate].fail;
+				}
+				const failTarget = this.nodes[failCandidate].children.get(ch) ?? 0;
+				this.nodes[childIdx].fail = childIdx === failTarget ? 0 : failTarget;
+				if (this.nodes[this.nodes[childIdx].fail].outputs.length > 0) {
+					this.nodes[childIdx].outputs = [
+						...this.nodes[childIdx].outputs,
+						...this.nodes[this.nodes[childIdx].fail].outputs
+					];
+				}
+			}
+		}
+
+		this.built = true;
+	}
+
+	public search(text: string): Array<{ start: number; end: number; output: AutomatonOutput }> {
+		if (this.nodes.length <= 1 || !text) return [];
+		if (!this.built) {
+			this.buildFailureLinks();
+		}
+
+		const matches: Array<{ start: number; end: number; output: AutomatonOutput }> = [];
+		let state = 0;
+
+		for (let i = 0; i < text.length; i++) {
+			const ch = text[i];
+			while (state !== 0 && !this.nodes[state].children.has(ch)) {
+				state = this.nodes[state].fail;
+			}
+			state = this.nodes[state].children.get(ch) ?? 0;
+
+			const outputs = this.nodes[state].outputs;
+			if (outputs.length > 0) {
+				for (const output of outputs) {
+					const end = i + 1;
+					const start = end - output.length;
+					if (start >= 0) {
+						matches.push({ start, end, output });
+					}
+				}
+			}
+		}
+
+		return matches;
+	}
+}
+
+interface CompiledRegexEntry {
+	id: string;
+	value: string;
+	regex: RegExp;
+}
+
+/**
+ * Custom Rule Compilation & Execution Engine (Aho-Corasick + Pre-compiled SafeRegExp)
+ */
+export class CustomRuleEngine {
+	private caseSensitiveAutomaton = new AhoCorasickAutomaton();
+	private caseInsensitiveAutomaton = new AhoCorasickAutomaton();
+	private hasCaseSensitivePatterns = false;
+	private hasCaseInsensitivePatterns = false;
+	private compiledRegexes: CompiledRegexEntry[] = [];
+
+	constructor(rules: CustomRule[] = []) {
+		this.compile(rules);
+	}
+
+	public compile(rules: CustomRule[]): void {
+		this.caseSensitiveAutomaton = new AhoCorasickAutomaton();
+		this.caseInsensitiveAutomaton = new AhoCorasickAutomaton();
+		this.hasCaseSensitivePatterns = false;
+		this.hasCaseInsensitivePatterns = false;
+		this.compiledRegexes = [];
+
+		for (const rule of rules) {
+			if (!rule || !rule.enabled) continue;
+			const validation = validateCustomRule(rule.type, rule.value);
+			if (!validation.valid) continue;
+
+			const rawVal = rule.value.trim();
+			if (rule.type === 'EXACT' || rule.type === 'PHRASE') {
+				const output: AutomatonOutput = {
+					id: rule.id,
+					type: rule.type,
+					value: rawVal,
+					length: rawVal.length
+				};
+				if (rule.caseSensitive) {
+					this.caseSensitiveAutomaton.addPattern(rawVal, output);
+					this.hasCaseSensitivePatterns = true;
+				} else {
+					const lowered = rawVal.toLowerCase();
+					this.caseInsensitiveAutomaton.addPattern(lowered, {
+						...output,
+						length: lowered.length
+					});
+					this.hasCaseInsensitivePatterns = true;
+				}
+			} else if (rule.type === 'REGEX') {
+				try {
+					const flags = rule.caseSensitive ? 'g' : 'gi';
+					this.compiledRegexes.push({
+						id: rule.id,
+						value: rawVal,
+						regex: new RegExp(rawVal, flags)
+					});
+				} catch {
+					// Ignore invalid regex
+				}
+			}
+		}
+
+		if (this.hasCaseSensitivePatterns) {
+			this.caseSensitiveAutomaton.buildFailureLinks();
+		}
+		if (this.hasCaseInsensitivePatterns) {
+			this.caseInsensitiveAutomaton.buildFailureLinks();
+		}
+	}
+
+	private isWholeWordMatch(text: string, start: number, end: number): boolean {
+		const startIsWord = start < text.length && WORD_CHAR_REGEX.test(text[start]);
+		const endIsWord = end > 0 && WORD_CHAR_REGEX.test(text[end - 1]);
+
+		if (startIsWord && start > 0 && WORD_CHAR_REGEX.test(text[start - 1])) {
+			return false;
+		}
+		if (endIsWord && end < text.length && WORD_CHAR_REGEX.test(text[end])) {
+			return false;
+		}
+		return true;
+	}
+
+	public scan(text: string, config?: Partial<ScanConfig>): RedactionEntity[] {
+		if (!text) return [];
+		if (!isTypeEnabled('CUSTOM_RULE', config?.enabledTypes)) return [];
+
+		const entities: RedactionEntity[] = [];
+
+		if (this.hasCaseSensitivePatterns) {
+			const matches = this.caseSensitiveAutomaton.search(text);
+			for (const m of matches) {
+				if (m.output.type === 'EXACT' && !this.isWholeWordMatch(text, m.start, m.end)) {
+					continue;
+				}
+				entities.push({
+					type: 'CUSTOM_RULE',
+					start: m.start,
+					end: m.end,
+					source: 'CUSTOM',
+					confidence: 1.0,
+					redacted: true,
+					ruleId: m.output.id,
+					ruleValue: m.output.value
+				});
+			}
+		}
+
+		if (this.hasCaseInsensitivePatterns) {
+			const lowerText = text.toLowerCase();
+			// Only use fast-path offsets when lowerText length matches text length
+			if (lowerText.length === text.length) {
+				const matches = this.caseInsensitiveAutomaton.search(lowerText);
+				for (const m of matches) {
+					if (m.output.type === 'EXACT' && !this.isWholeWordMatch(text, m.start, m.end)) {
+						continue;
+					}
+					entities.push({
+						type: 'CUSTOM_RULE',
+						start: m.start,
+						end: m.end,
+						source: 'CUSTOM',
+						confidence: 1.0,
+						redacted: true,
+						ruleId: m.output.id,
+						ruleValue: m.output.value
+					});
+				}
+			}
+		}
+
+		for (const entry of this.compiledRegexes) {
+			const regex = new RegExp(entry.regex.source, entry.regex.flags);
+			const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+			let match: RegExpExecArray | null;
+			let iterations = 0;
+
+			while ((match = regex.exec(text)) !== null) {
+				const rawMatch = match[0];
+				if (rawMatch.length === 0) {
+					regex.lastIndex++;
+					continue;
+				}
+				entities.push({
+					type: 'CUSTOM_RULE',
+					start: match.index,
+					end: match.index + rawMatch.length,
+					source: 'CUSTOM',
+					confidence: 1.0,
+					redacted: true,
+					ruleId: entry.id,
+					ruleValue: entry.value
+				});
+
+				iterations++;
+				// Guard against excessive execution time (> 5ms budget per custom regex rule)
+				const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+				if (now - startTime > 5 || iterations > 5000) {
+					break;
+				}
+			}
+		}
+
+		return ConflictResolver.resolve(entities);
+	}
+}
 
 /**
  * Calculate Shannon Entropy H(X) = - sum P(x_i) log2 P(x_i)
@@ -235,10 +553,10 @@ export class RegexEngine {
 }
 
 /**
- * Zero-mask regex matches and synthetic noise (hex hashes, stack traces) with spaces
- * so the NER model never evaluates synthetic tokens while preserving 1:1 character offsets.
+ * Zero-mask regex matches, custom rule matches, and synthetic noise (hex hashes, stack traces) with spaces
+ * so the NER model never evaluates already-finalized or synthetic tokens while preserving 1:1 character offsets.
  */
-export function createZeroMaskedBuffer(text: string, regexEntities: RedactionEntity[]): string {
+export function createZeroMaskedBuffer(text: string, priorEntities: RedactionEntity[]): string {
 	if (!text) return '';
 	const chars = text.split('');
 
@@ -252,7 +570,7 @@ export function createZeroMaskedBuffer(text: string, regexEntities: RedactionEnt
 		}
 	};
 
-	for (const entity of regexEntities) {
+	for (const entity of priorEntities) {
 		maskRange(entity.start, entity.end);
 	}
 
@@ -565,9 +883,9 @@ export function alignAndNormalizeNerTokens(
 /**
  * Stage 3: Conflict Resolution and Boundary Clamping
  * Precedence Hierarchy:
- * 1. Absolute Priority: REGEX > NER
- * 2. Span Collisions: Longest-Match vs Class Supremacy (wider span wins; for NER vs dictionary ORG, confidence > 0.80)
- * 3. Cross-chunk deduplication and adjoining entity merging
+ * 1. Built-in Hard Regex (source === 'REGEX') - Highest priority
+ * 2. User Custom Rules (source === 'CUSTOM') - Second priority (overrides general AI detections)
+ * 3. Probabilistic NER (source === 'NER') - Lowest priority
  */
 export class ConflictResolver {
 	public static resolve(entities: RedactionEntity[]): RedactionEntity[] {
@@ -603,17 +921,41 @@ export class ConflictResolver {
 			}
 		}
 
-		// Filter & merge NER entities
+		// Tier 2: Custom Rules (yield to Built-in Hard Regex; longest match wins among overlapping custom rules)
+		const customEntities = entities
+			.filter((e) => e.source === 'CUSTOM')
+			.sort((a, b) => a.start - b.start || b.end - a.end);
+
+		const nonCollidingCustom = customEntities.filter(
+			(custom) => !resolvedRegex.some((reg) => custom.start < reg.end && custom.end > reg.start)
+		);
+
+		const resolvedCustom: RedactionEntity[] = [];
+		for (const candidate of nonCollidingCustom) {
+			const existingIdx = resolvedCustom.findIndex(
+				(e) => candidate.start < e.end && candidate.end > e.start
+			);
+			if (existingIdx === -1) {
+				resolvedCustom.push({ ...candidate });
+			} else {
+				const existing = resolvedCustom[existingIdx];
+				if (candidate.end - candidate.start > existing.end - existing.start) {
+					resolvedCustom[existingIdx] = { ...candidate };
+				}
+			}
+		}
+
+		// Tier 3: Probabilistic NER (yields to both Built-in Hard Regex and User Custom Rules)
 		const nerEntities = entities
 			.filter((e) => e.source === 'NER')
 			.sort((a, b) => a.start - b.start || b.end - a.end);
 
-		// 1. Discard any NER entity that collides (even partially) with a Regex entity
+		const higherPriority = [...resolvedRegex, ...resolvedCustom];
 		const nonCollidingNer = nerEntities.filter(
-			(ner) => !resolvedRegex.some((reg) => ner.start < reg.end && ner.end > reg.start)
+			(ner) => !higherPriority.some((hp) => ner.start < hp.end && ner.end > hp.start)
 		);
 
-		// 2. Merge overlapping or identical NER entities from sliding window chunks & resolve collisions
+		// Merge overlapping or identical NER entities from sliding window chunks & resolve collisions
 		const resolvedNer: RedactionEntity[] = [];
 		for (const candidate of nonCollidingNer) {
 			const overlapIdx = resolvedNer.findIndex(
@@ -658,14 +1000,16 @@ export class ConflictResolver {
 			}
 		}
 
-		return [...resolvedRegex, ...resolvedNer].sort((a, b) => a.start - b.start || b.end - a.end);
+		return [...resolvedRegex, ...resolvedCustom, ...resolvedNer].sort(
+			(a, b) => a.start - b.start || b.end - a.end
+		);
 	}
 }
 
 /**
  * Compact numeric buffer serialization for postMessage transfer (Phase 2.1 Bottleneck 1)
  * Stride = 6 integers per entity:
- * [typeEnum, start, end, sourceEnum (1=REGEX, 2=NER), confidenceScaled (0..10000), flags (bit0=ambiguous, bit1=redacted)]
+ * [typeEnum, start, end, sourceEnum (1=REGEX, 2=NER, 3=CUSTOM), confidenceScaled (0..10000), flags (bit0=ambiguous, bit1=redacted)]
  */
 const BUFFER_STRIDE = 6;
 
@@ -677,7 +1021,7 @@ export function encodeEntitiesToBuffer(entities: RedactionEntity[]): Int32Array 
 		buffer[offset] = ENTITY_TYPE_TO_ENUM[e.type] ?? 1;
 		buffer[offset + 1] = e.start;
 		buffer[offset + 2] = e.end;
-		buffer[offset + 3] = e.source === 'REGEX' ? 1 : 2;
+		buffer[offset + 3] = e.source === 'REGEX' ? 1 : e.source === 'CUSTOM' ? 3 : 2;
 		buffer[offset + 4] = Math.round((e.confidence ?? 1) * 10000);
 		const flags = (e.ambiguous ? 1 : 0) | (e.redacted !== false ? 2 : 0);
 		buffer[offset + 5] = flags;
@@ -691,7 +1035,8 @@ export function decodeEntitiesFromBuffer(buffer: Int32Array): RedactionEntity[] 
 		const type = ENUM_TO_ENTITY_TYPE[buffer[offset]] ?? 'PER';
 		const start = buffer[offset + 1];
 		const end = buffer[offset + 2];
-		const source = buffer[offset + 3] === 1 ? 'REGEX' : 'NER';
+		const sourceCode = buffer[offset + 3];
+		const source = sourceCode === 1 ? 'REGEX' : sourceCode === 3 ? 'CUSTOM' : 'NER';
 		const confidence = buffer[offset + 4] / 10000;
 		const flags = buffer[offset + 5];
 		const ambiguous = (flags & 1) !== 0;
@@ -711,7 +1056,7 @@ export function decodeEntitiesFromBuffer(buffer: Int32Array): RedactionEntity[] 
 }
 
 /**
- * Apply redactions to raw text using safe default substitutions ([NAME], [ORG], [IP], etc.)
+ * Apply redactions to raw text using safe default substitutions ([NAME], [ORG], [IP], [CUSTOM], etc.)
  */
 export function applyRedactions(text: string, entities: RedactionEntity[]): string {
 	if (!text || !entities || entities.length === 0) return text;

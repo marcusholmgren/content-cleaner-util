@@ -1,10 +1,18 @@
-import { DEFAULT_ENABLED_TYPES, RegexEngine, decodeEntitiesFromBuffer } from './Engine';
+import {
+	ConflictResolver,
+	CustomRuleEngine,
+	DEFAULT_ENABLED_TYPES,
+	RegexEngine,
+	decodeEntitiesFromBuffer
+} from './Engine';
 import type {
+	CustomRule,
 	HostMessage,
 	RuntimeDevice,
 	ScanConfig,
 	ScanRequest,
-	ScanResultPayload
+	ScanResultPayload,
+	SyncCustomRulesPayload
 } from './types';
 
 interface PendingJob {
@@ -13,68 +21,101 @@ interface PendingJob {
 }
 
 export class WorkerManager {
-	private worker: Worker | null = null;
+	public worker: Worker | null = null;
 	private currentJobId = 0;
 	private activeResolvers = new Map<number, PendingJob>();
 	public runtimeDevice: RuntimeDevice = 'regex-only';
 	private deviceListeners = new Set<(device: RuntimeDevice) => void>();
+	private fallbackCustomEngine = new CustomRuleEngine();
+	private latestCustomRules: CustomRule[] = [];
 
 	constructor() {
 		if (typeof window !== 'undefined' && typeof Worker !== 'undefined') {
-			this.worker = new Worker(new URL('./workers/redactor.worker.ts', import.meta.url), {
-				type: 'module'
-			});
+			this.initWorker();
+		}
+	}
 
-			this.worker.onmessage = (event: MessageEvent<HostMessage>) => {
-				const data = event.data;
-				if (!data) return;
+	private initWorker() {
+		this.worker = new Worker(new URL('./workers/redactor.worker.ts', import.meta.url), {
+			type: 'module'
+		});
 
-				if (data.type === 'MODEL_READY') {
-					this.runtimeDevice = data.device;
+		this.worker.onmessage = (event: MessageEvent<HostMessage>) => {
+			const data = event.data;
+			if (!data) return;
+
+			if (data.type === 'MODEL_READY') {
+				this.runtimeDevice = data.device;
+				for (const listener of this.deviceListeners) {
+					listener(data.device);
+				}
+				return;
+			}
+
+			const pending = this.activeResolvers.get(data.jobId);
+			if (!pending) return;
+			this.activeResolvers.delete(data.jobId);
+
+			if (data.type === 'SCAN_ERROR') {
+				pending.reject(new Error(data.error));
+				return;
+			}
+
+			if (data.type === 'SCAN_SUCCESS') {
+				if (data.runtimeDevice) {
+					this.runtimeDevice = data.runtimeDevice;
 					for (const listener of this.deviceListeners) {
-						listener(data.device);
+						listener(data.runtimeDevice);
 					}
-					return;
 				}
 
-				const pending = this.activeResolvers.get(data.jobId);
-				if (!pending) return;
-				this.activeResolvers.delete(data.jobId);
+				const entities =
+					Array.isArray(data.entities) && data.entities.length > 0
+						? data.entities
+						: data.buffer instanceof Int32Array && data.buffer.length > 0
+							? decodeEntitiesFromBuffer(data.buffer)
+							: [];
 
-				if (data.type === 'SCAN_ERROR') {
-					pending.reject(new Error(data.error));
-					return;
-				}
+				pending.resolve({
+					...data,
+					entities
+				});
+			}
+		};
 
-				if (data.type === 'SCAN_SUCCESS') {
-					if (data.runtimeDevice) {
-						this.runtimeDevice = data.runtimeDevice;
-						for (const listener of this.deviceListeners) {
-							listener(data.runtimeDevice);
-						}
-					}
+		this.worker.onerror = (event: ErrorEvent) => {
+			const err = new Error(event.message || 'Worker execution error');
+			for (const [, pending] of this.activeResolvers) {
+				pending.reject(err);
+			}
+			this.activeResolvers.clear();
+		};
 
-					const entities =
-						Array.isArray(data.entities) && data.entities.length > 0
-							? data.entities
-							: data.buffer instanceof Int32Array && data.buffer.length > 0
-								? decodeEntitiesFromBuffer(data.buffer)
-								: [];
+		if (this.latestCustomRules.length > 0) {
+			this.worker.postMessage({
+				type: 'SYNC_CUSTOM_RULES',
+				rules: this.latestCustomRules
+			} satisfies SyncCustomRulesPayload);
+		}
+	}
 
-					pending.resolve({
-						...data,
-						entities
-					});
-				}
-			};
+	public syncCustomRules(rules: CustomRule[]): void {
+		const plainRules = rules.map((r) => ({
+			id: String(r.id),
+			type: r.type,
+			value: String(r.value),
+			caseSensitive: Boolean(r.caseSensitive),
+			enabled: Boolean(r.enabled),
+			createdAt: Number(r.createdAt)
+		}));
+		this.latestCustomRules = plainRules;
+		this.fallbackCustomEngine.compile(plainRules);
 
-			this.worker.onerror = (event: ErrorEvent) => {
-				const err = new Error(event.message || 'Worker execution error');
-				for (const [, pending] of this.activeResolvers) {
-					pending.reject(err);
-				}
-				this.activeResolvers.clear();
-			};
+		if (this.worker) {
+			this.worker.postMessage({
+				type: 'SYNC_CUSTOM_RULES',
+				rules: plainRules
+			} satisfies SyncCustomRulesPayload);
 		}
 	}
 
@@ -94,7 +135,9 @@ export class WorkerManager {
 
 		if (!this.worker) {
 			const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
-			const entities = RegexEngine.scan(text, resolvedConfig);
+			const regexEntities = RegexEngine.scan(text, resolvedConfig);
+			const customEntities = this.fallbackCustomEngine.scan(text, resolvedConfig);
+			const entities = ConflictResolver.resolve([...regexEntities, ...customEntities]);
 			const durationMs = Math.max(
 				0,
 				Math.round(
