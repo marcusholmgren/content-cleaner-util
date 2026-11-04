@@ -1,77 +1,185 @@
 import { pipeline, env } from '@huggingface/transformers';
-import type { ScanRequest, ScanResultPayload } from '../types';
+import {
+	RegexEngine,
+	ConflictResolver,
+	createZeroMaskedBuffer,
+	splitIntoChunks,
+	shouldSkipChunk,
+	alignAndNormalizeNerTokens,
+	encodeEntitiesToBuffer,
+	type RawNerToken
+} from '../Engine';
+import type {
+	HostMessage,
+	RedactionEntity,
+	RuntimeDevice,
+	ScanRequest,
+	ScanResultPayload
+} from '../types';
 
 // Force browser execution constraints
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-let classifierPromise: Promise<unknown> | null = null;
+type ClassifierFn = (
+	text: string,
+	options?: { ignore_labels?: string[] }
+) => Promise<RawNerToken[]>;
 
-async function getClassifier() {
-	if (!classifierPromise) {
-		classifierPromise = pipeline('token-classification', 'Xenova/rubert-tiny-ner', {
-			device: 'webgpu' // Auto-falls back to wasm if WebGPU is unavailable
+let classifierPromise: Promise<ClassifierFn> | null = null;
+let activeDevice: RuntimeDevice = 'regex-only';
+
+const DEFAULT_MODEL_ID = 'Xenova/bert-base-NER';
+
+/**
+ * Probe whether WebGPU is genuinely usable (adapter + device can be acquired).
+ * Note: Checking `'gpu' in navigator` alone is insufficient in Chrome on Linux/Windows
+ * without WebGPU enabled, where `navigator.gpu` exists but `requestAdapter()` returns `null`.
+ * Calling `pipeline(..., { device: 'webgpu' })` when `requestAdapter()` returns `null`
+ * permanently rejects Transformers.js's internal `webInitChain` promise, breaking WASM fallback.
+ */
+async function isWebGpuFunctional(): Promise<boolean> {
+	try {
+		if (typeof navigator === 'undefined' || !('gpu' in navigator) || !navigator.gpu) {
+			return false;
+		}
+		const gpu = navigator.gpu as {
+			requestAdapter?: () => Promise<{
+				requestDevice?: () => Promise<{ destroy?: () => void } | null>;
+			} | null>;
+		};
+		if (typeof gpu.requestAdapter !== 'function') {
+			return false;
+		}
+		const adapter = await gpu.requestAdapter();
+		if (!adapter || typeof adapter.requestDevice !== 'function') {
+			return false;
+		}
+		const device = await adapter.requestDevice();
+		if (!device) {
+			return false;
+		}
+		device.destroy?.();
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function initClassifier(): Promise<ClassifierFn> {
+	const useWebGpu = await isWebGpuFunctional();
+	const device: 'webgpu' | 'wasm' = useWebGpu ? 'webgpu' : 'wasm';
+
+	try {
+		const instance = await pipeline('token-classification', DEFAULT_MODEL_ID, {
+			device,
+			dtype: 'q8'
 		});
+		activeDevice = device;
+		self.postMessage({
+			type: 'MODEL_READY',
+			device
+		} satisfies HostMessage);
+		return instance as unknown as ClassifierFn;
+	} catch (err) {
+		classifierPromise = null;
+		throw err;
+	}
+}
+
+async function getClassifier(): Promise<ClassifierFn> {
+	if (!classifierPromise) {
+		classifierPromise = initClassifier();
 	}
 	return classifierPromise;
 }
 
-const REGEX_RULES = [
-	{ type: 'EMAIL' as const, rule: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b/g },
-	{ type: 'IP' as const, rule: /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g },
-	{ type: 'TOKEN' as const, rule: /\b(?:ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{48})\b/g }
-];
-
 self.onmessage = async (e: MessageEvent<ScanRequest>) => {
-	const { jobId, text } = e.data;
-	const entities: ScanResultPayload['entities'] = [];
+	const data = e.data;
+	if (!data || data.type !== 'SCAN_PAYLOAD') return;
 
-	// 1. Synchronous Regex Pass
-	for (const { type, rule } of REGEX_RULES) {
-		let match: RegExpExecArray | null;
-		while ((match = rule.exec(text)) !== null) {
-			entities.push({
-				type,
-				start: match.index,
-				end: match.index + match[0].length,
-				source: 'REGEX',
-				confidence: 1.0
-			});
-		}
-	}
+	const { jobId, text, config } = data;
+	const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-	// 2. Transformer Inference Pass
 	try {
-		const classifier = await getClassifier();
-		const rawTokens: Array<{ entity: string; start: number; end: number; score: number }> = await (
-			classifier as (
-				...args: unknown[]
-			) => Promise<Array<{ entity: string; start: number; end: number; score: number }>>
-		)(text, {
-			ignore_labels: ['O']
-		});
+		if (!text || text.trim().length === 0) {
+			const emptyBuffer = new Int32Array(0);
+			self.postMessage(
+				{
+					type: 'SCAN_SUCCESS',
+					jobId,
+					entities: [],
+					buffer: emptyBuffer,
+					runtimeDevice: activeDevice,
+					durationMs: 0
+				} satisfies ScanResultPayload,
+				{ transfer: [emptyBuffer.buffer] }
+			);
+			return;
+		}
 
-		for (const token of rawTokens) {
-			const type = token.entity.replace(/^[BI]-/, '') as 'PER' | 'ORG';
-			// Basic collision skip if regex already handled the range
-			const overlaps = entities.some((e) => token.start >= e.start && token.end <= e.end);
-			if (!overlaps) {
-				entities.push({
-					type,
-					start: token.start,
-					end: token.end,
-					source: 'NER',
-					confidence: token.score
-				});
+		// Stage 1: Synchronous Deterministic Regex & High-Entropy Pass
+		const regexEntities = RegexEngine.scan(text, config);
+		const nerEntities: RedactionEntity[] = [];
+
+		const enabledTypes = config?.enabledTypes ?? [];
+		const nerRequested =
+			enabledTypes.length === 0 ||
+			enabledTypes.some((t) => ['PER', 'ORG', 'LOC', 'AMBIGUOUS_PER', 'AMBIGUOUS_ORG'].includes(t));
+
+		// Stage 2: Probabilistic NER Pass with Zero-Masking, Chunking, and Chunk Skipping
+		if (nerRequested) {
+			const zeroMaskedText = createZeroMaskedBuffer(text, regexEntities);
+			const chunks = splitIntoChunks(zeroMaskedText, 384, 64);
+			const eligibleChunks = chunks.filter((chunk) => !shouldSkipChunk(chunk.text));
+
+			if (eligibleChunks.length > 0) {
+				try {
+					const classifier = await getClassifier();
+					for (const chunk of eligibleChunks) {
+						const rawTokens = await classifier(chunk.text, {
+							ignore_labels: ['O']
+						});
+						const aligned = alignAndNormalizeNerTokens(
+							Array.isArray(rawTokens) ? rawTokens : [],
+							chunk.text,
+							chunk.startOffset,
+							text,
+							config
+						);
+						nerEntities.push(...aligned);
+					}
+				} catch (err) {
+					activeDevice = 'regex-only';
+					console.error('NER Inference failed, returning regex results only', err);
+				}
 			}
 		}
-	} catch (err) {
-		console.error('NER Inference failed, returning regex results only', err);
-	}
 
-	self.postMessage({
-		type: 'SCAN_SUCCESS',
-		jobId,
-		entities: entities.sort((a, b) => a.start - b.start)
-	} satisfies ScanResultPayload);
+		// Stage 3: Conflict Resolution and Boundary Clamping
+		const resolvedEntities = ConflictResolver.resolve([...regexEntities, ...nerEntities]);
+		const buffer = encodeEntitiesToBuffer(resolvedEntities);
+		const durationMs = Math.max(
+			0,
+			Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startTime)
+		);
+
+		self.postMessage(
+			{
+				type: 'SCAN_SUCCESS',
+				jobId,
+				entities: resolvedEntities,
+				buffer,
+				runtimeDevice: activeDevice,
+				durationMs
+			} satisfies ScanResultPayload,
+			{ transfer: [buffer.buffer] }
+		);
+	} catch (err) {
+		self.postMessage({
+			type: 'SCAN_ERROR',
+			jobId,
+			error: err instanceof Error ? err.message : String(err)
+		} satisfies HostMessage);
+	}
 };
