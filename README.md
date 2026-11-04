@@ -1,56 +1,38 @@
-# sv
+# Content Cleaner Util (PII Redactor)
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+A client-side Svelte 5 application that detects and redacts Personally Identifiable Information (PII) using a hybrid Regex and Web Worker-based NER (Named Entity Recognition) pipeline.
 
-## Creating a project
+## Features
 
-If you're seeing this, you've probably already done this step. Congrats!
+- **Hybrid Detection Engine**:
+  - **Deterministic Regex & Heuristics**: Detects emails, IPv4/IPv6 addresses, API keys / secrets (GitHub, AWS, Stripe, Slack, JWT, UUID), credit card numbers (with Luhn validation), and high-entropy secret tokens.
+  - **Machine Learning NER**: In-browser Named Entity Recognition via `@huggingface/transformers` running in a dedicated Web Worker sandbox (WebGPU with WASM fallback).
+- **Two-Layer Synchronized Editor**: Syntax-highlighted overlay decoupled from the transparent input textarea.
+- **Ambiguous Entity Support**: Interactive click-to-toggle redaction for ambiguous proper nouns and medium-confidence detections.
+- **Verification on Copy**: Pre-copy sanity checks for residual unmasked sensitive data (such as SSNs).
 
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-npx sv@1.2.0 create --template minimal --types ts --add prettier eslint vitest="usages:unit,component" tailwindcss="plugins:typography,forms" --install npm .
-```
-
-## Adding features
-
-Add features to your project with `sv add`:
+## Development
 
 ```sh
-npx sv add
-```
-
-For example, to add Tailwind CSS:
-
-```sh
-npx sv add tailwindcss
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
+npm install
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
 ```
 
-## Building
+## Testing & Quality Checks
 
-To create a production version of your app:
+```sh
+npm run check      # Svelte TypeScript check
+npm run lint       # ESLint & Prettier
+npm test           # Vitest unit and browser component tests
+```
+
+## Building for Production
 
 ```sh
 npm run build
+npm run preview
 ```
 
-You can preview the production build with `npm run preview`.
+## Deployment
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+The app is built as a static site using `@sveltejs/adapter-static` and automatically deployed to GitHub Pages via GitHub Actions upon pushes to `main`.
