@@ -8,7 +8,32 @@ export type EntityType =
 	| 'CREDIT_CARD'
 	| 'SUSPECTED_TOKEN'
 	| 'AMBIGUOUS_PER'
-	| 'AMBIGUOUS_ORG';
+	| 'AMBIGUOUS_ORG'
+	| 'CUSTOM_RULE';
+
+export type CustomRuleType = 'EXACT' | 'PHRASE' | 'REGEX';
+
+export interface CustomRule {
+	id: string;
+	type: CustomRuleType;
+	value: string;
+	caseSensitive: boolean;
+	enabled: boolean;
+	createdAt: number;
+}
+
+export interface CompiledCustomRule {
+	id: string;
+	type: CustomRuleType;
+	value: string;
+	caseSensitive: boolean;
+	matcher: string | RegExp;
+}
+
+export interface SyncCustomRulesPayload {
+	type: 'SYNC_CUSTOM_RULES';
+	rules: CustomRule[];
+}
 
 export type RuntimeDevice = 'webgpu' | 'wasm' | 'regex-only';
 
@@ -16,10 +41,12 @@ export interface RedactionEntity {
 	type: EntityType;
 	start: number;
 	end: number;
-	source: 'REGEX' | 'NER';
+	source: 'REGEX' | 'CUSTOM' | 'NER';
 	confidence: number;
 	ambiguous?: boolean;
 	redacted?: boolean;
+	ruleId?: string;
+	ruleValue?: string;
 }
 
 export interface ScanConfig {
@@ -54,5 +81,5 @@ export interface ModelReadyPayload {
 	device: RuntimeDevice;
 }
 
-export type WorkerMessage = ScanRequest;
+export type WorkerMessage = ScanRequest | SyncCustomRulesPayload;
 export type HostMessage = ScanResultPayload | WorkerErrorPayload | ModelReadyPayload;

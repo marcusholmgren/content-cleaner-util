@@ -1,3 +1,4 @@
+import { CustomRuleStore } from './CustomRuleStore.svelte';
 import {
 	DEFAULT_ENABLED_TYPES,
 	applyRedactions,
@@ -5,7 +6,7 @@ import {
 	type VerificationResult
 } from './Engine';
 import { WorkerManager } from './WorkerManager';
-import type { EntityType, RedactionEntity, RuntimeDevice } from './types';
+import type { CustomRule, EntityType, RedactionEntity, RuntimeDevice } from './types';
 
 export class RedactorState {
 	rawText = $state('');
@@ -19,6 +20,7 @@ export class RedactorState {
 	errorMessage = $state<string | null>(null);
 
 	workerManager: WorkerManager;
+	customRuleStore: CustomRuleStore;
 	private timeoutId: ReturnType<typeof setTimeout> | null = null;
 	private lastJobId = -1;
 	private latestInputSeq = 0;
@@ -29,6 +31,11 @@ export class RedactorState {
 		this.runtimeDevice = this.workerManager.runtimeDevice;
 		this.unsubscribeDevice = this.workerManager.onDeviceChange((device) => {
 			this.runtimeDevice = device;
+		});
+		this.customRuleStore = new CustomRuleStore(this.workerManager, () => {
+			if (this.rawText.trim().length > 0) {
+				this.handleInput(this.rawText);
+			}
 		});
 	}
 
@@ -54,6 +61,10 @@ export class RedactorState {
 		}
 		return `Regex Engine (${ms})`;
 	});
+
+	async init() {
+		await this.customRuleStore.loadCustomRules();
+	}
 
 	handleInput(text: string) {
 		this.rawText = text;
@@ -149,6 +160,26 @@ export class RedactorState {
 		if (this.rawText.trim().length > 0) {
 			this.handleInput(this.rawText);
 		}
+	}
+
+	async addCustomRule(rule: Omit<CustomRule, 'id' | 'createdAt'>) {
+		return this.customRuleStore.addCustomRule(rule);
+	}
+
+	async updateCustomRule(id: string, updates: Partial<Omit<CustomRule, 'id' | 'createdAt'>>) {
+		return this.customRuleStore.updateCustomRule(id, updates);
+	}
+
+	async removeCustomRule(id: string) {
+		await this.customRuleStore.removeCustomRule(id);
+	}
+
+	async toggleCustomRule(id: string) {
+		await this.customRuleStore.toggleRule(id);
+	}
+
+	async toggleCustomRuleCaseSensitivity(id: string) {
+		await this.customRuleStore.toggleCaseSensitivity(id);
 	}
 
 	verifyBeforeCopy(): VerificationResult {

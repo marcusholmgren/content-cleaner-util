@@ -1,6 +1,7 @@
 import { pipeline, env } from '@huggingface/transformers';
 import {
 	RegexEngine,
+	CustomRuleEngine,
 	ConflictResolver,
 	createZeroMaskedBuffer,
 	splitIntoChunks,
@@ -13,8 +14,8 @@ import type {
 	HostMessage,
 	RedactionEntity,
 	RuntimeDevice,
-	ScanRequest,
-	ScanResultPayload
+	ScanResultPayload,
+	WorkerMessage
 } from '../types';
 
 // Force browser execution constraints
@@ -28,6 +29,7 @@ type ClassifierFn = (
 
 let classifierPromise: Promise<ClassifierFn> | null = null;
 let activeDevice: RuntimeDevice = 'regex-only';
+const customRuleEngine = new CustomRuleEngine();
 
 const DEFAULT_MODEL_ID = 'Xenova/bert-base-NER';
 
@@ -94,9 +96,16 @@ async function getClassifier(): Promise<ClassifierFn> {
 	return classifierPromise;
 }
 
-self.onmessage = async (e: MessageEvent<ScanRequest>) => {
+self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 	const data = e.data;
-	if (!data || data.type !== 'SCAN_PAYLOAD') return;
+	if (!data) return;
+
+	if (data.type === 'SYNC_CUSTOM_RULES') {
+		customRuleEngine.compile(Array.isArray(data.rules) ? data.rules : []);
+		return;
+	}
+
+	if (data.type !== 'SCAN_PAYLOAD') return;
 
 	const { jobId, text, config } = data;
 	const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -118,8 +127,12 @@ self.onmessage = async (e: MessageEvent<ScanRequest>) => {
 			return;
 		}
 
-		// Stage 1: Synchronous Deterministic Regex & High-Entropy Pass
+		// Stage 1a: Synchronous Deterministic Regex & High-Entropy Pass
 		const regexEntities = RegexEngine.scan(text, config);
+
+		// Stage 1b: User Custom Rules (Aho-Corasick + Pre-compiled SafeRegex)
+		const customEntities = customRuleEngine.scan(text, config);
+
 		const nerEntities: RedactionEntity[] = [];
 
 		const enabledTypes = config?.enabledTypes ?? [];
@@ -127,9 +140,9 @@ self.onmessage = async (e: MessageEvent<ScanRequest>) => {
 			enabledTypes.length === 0 ||
 			enabledTypes.some((t) => ['PER', 'ORG', 'LOC', 'AMBIGUOUS_PER', 'AMBIGUOUS_ORG'].includes(t));
 
-		// Stage 2: Probabilistic NER Pass with Zero-Masking, Chunking, and Chunk Skipping
+		// Stage 2: Probabilistic NER Pass with Zero-Masking (skips both Regex and Custom Rule spans)
 		if (nerRequested) {
-			const zeroMaskedText = createZeroMaskedBuffer(text, regexEntities);
+			const zeroMaskedText = createZeroMaskedBuffer(text, [...regexEntities, ...customEntities]);
 			const chunks = splitIntoChunks(zeroMaskedText, 384, 64);
 			const eligibleChunks = chunks.filter((chunk) => !shouldSkipChunk(chunk.text));
 
@@ -156,8 +169,12 @@ self.onmessage = async (e: MessageEvent<ScanRequest>) => {
 			}
 		}
 
-		// Stage 3: Conflict Resolution and Boundary Clamping
-		const resolvedEntities = ConflictResolver.resolve([...regexEntities, ...nerEntities]);
+		// Stage 3: Conflict Resolution and Boundary Clamping (REGEX > CUSTOM > NER)
+		const resolvedEntities = ConflictResolver.resolve([
+			...regexEntities,
+			...customEntities,
+			...nerEntities
+		]);
 		const buffer = encodeEntitiesToBuffer(resolvedEntities);
 		const durationMs = Math.max(
 			0,

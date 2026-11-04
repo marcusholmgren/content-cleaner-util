@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	ConflictResolver,
+	CustomRuleEngine,
 	RegexEngine,
 	alignAndNormalizeNerTokens,
 	applyRedactions,
@@ -13,6 +14,7 @@ import {
 	getViewportCharRange,
 	shouldSkipChunk,
 	splitIntoChunks,
+	validateCustomRule,
 	verifySanitizedText
 } from './Engine';
 
@@ -282,5 +284,99 @@ describe('Int32Array Buffer Transfer, Verification & Viewport Virtualization', (
 		});
 
 		expect(clonedSuccessfully).toBe(true);
+	});
+});
+
+describe('CustomRuleEngine, Aho-Corasick Automaton & Precedence (REGEX > CUSTOM > NER)', () => {
+	it('matches PHRASE, EXACT whole-word, and REGEX custom rules and redacts as [CUSTOM]', () => {
+		const engine = new CustomRuleEngine([
+			{
+				id: 'r1',
+				type: 'PHRASE',
+				value: 'Project Titan',
+				caseSensitive: false,
+				enabled: true,
+				createdAt: 1
+			},
+			{
+				id: 'r2',
+				type: 'EXACT',
+				value: ' secret ',
+				caseSensitive: true,
+				enabled: true,
+				createdAt: 2
+			},
+			{
+				id: 'r3',
+				type: 'REGEX',
+				value: 'TICKET-\\d{4}',
+				caseSensitive: true,
+				enabled: true,
+				createdAt: 3
+			}
+		]);
+
+		const text = 'Secretly discussing project titan and secret code for TICKET-4821.';
+		const matches = engine.scan(text);
+
+		expect(matches).toHaveLength(3);
+		expect(text.slice(matches[0].start, matches[0].end)).toBe('project titan');
+		expect(matches[0].ruleValue).toBe('Project Titan');
+		// "Secretly" is skipped by EXACT "secret", only standalone "secret" is matched
+		expect(text.slice(matches[1].start, matches[1].end)).toBe('secret');
+		expect(text.slice(matches[2].start, matches[2].end)).toBe('TICKET-4821');
+
+		expect(applyRedactions(text, matches)).toBe(
+			'Secretly discussing [CUSTOM] and [CUSTOM] code for [CUSTOM].'
+		);
+	});
+
+	it('validates custom regex syntax and rejects ReDoS nested quantifiers', () => {
+		expect(validateCustomRule('PHRASE', '   ').valid).toBe(false);
+		expect(validateCustomRule('REGEX', '[unclosed').valid).toBe(false);
+		expect(validateCustomRule('REGEX', '(a+)+$').valid).toBe(false);
+		expect(validateCustomRule('REGEX', 'PROJ-[0-9]{4}').valid).toBe(true);
+	});
+
+	it('enforces 3-tier precedence: Built-in REGEX > CUSTOM > NER', () => {
+		const resolved = ConflictResolver.resolve([
+			{
+				type: 'EMAIL',
+				start: 0,
+				end: 18,
+				source: 'REGEX',
+				confidence: 1.0,
+				redacted: true
+			},
+			{
+				type: 'CUSTOM_RULE',
+				start: 0,
+				end: 10, // Overlaps with built-in EMAIL regex -> should yield to REGEX
+				source: 'CUSTOM',
+				confidence: 1.0,
+				redacted: true
+			},
+			{
+				type: 'CUSTOM_RULE',
+				start: 25,
+				end: 38, // "Project Titan"
+				source: 'CUSTOM',
+				confidence: 1.0,
+				redacted: true
+			},
+			{
+				type: 'ORG',
+				start: 25,
+				end: 38, // NER also tags "Project Titan" -> should yield to CUSTOM
+				source: 'NER',
+				confidence: 0.95,
+				redacted: true
+			}
+		]);
+
+		expect(resolved).toHaveLength(2);
+		expect(resolved[0].source).toBe('REGEX');
+		expect(resolved[1].source).toBe('CUSTOM');
+		expect(resolved[1].type).toBe('CUSTOM_RULE');
 	});
 });
