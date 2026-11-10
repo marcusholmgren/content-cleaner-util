@@ -11,6 +11,7 @@ import type { CustomRule, EntityType, RedactionEntity, RuntimeDevice } from './t
 export class RedactorState {
 	rawText = $state('');
 	isProcessing = $state(false);
+	isScanStale = $state(false);
 	entities = $state<RedactionEntity[]>([]);
 	aggressiveMode = $state(false);
 	enabledTypes = $state<EntityType[]>([...DEFAULT_ENABLED_TYPES]);
@@ -41,6 +42,10 @@ export class RedactorState {
 
 	sanitizedText = $derived.by(() => {
 		return applyRedactions(this.rawText, this.entities);
+	});
+
+	canCopy = $derived.by(() => {
+		return this.rawText.trim().length > 0 && !this.isProcessing && !this.isScanStale;
 	});
 
 	statusText = $derived.by(() => {
@@ -80,11 +85,13 @@ export class RedactorState {
 		if (!text || text.trim().length === 0) {
 			this.entities = [];
 			this.isProcessing = false;
+			this.isScanStale = false;
 			this.lastDurationMs = null;
 			return;
 		}
 
 		this.isProcessing = true;
+		this.isScanStale = true;
 
 		this.timeoutId = setTimeout(async () => {
 			await this.runScan(text, seq);
@@ -106,6 +113,7 @@ export class RedactorState {
 			if (result.jobId >= this.lastJobId) {
 				this.lastJobId = result.jobId;
 				this.entities = result.entities ?? [];
+				this.isScanStale = false;
 				if (result.runtimeDevice) {
 					this.runtimeDevice = result.runtimeDevice;
 				}
@@ -183,6 +191,16 @@ export class RedactorState {
 	}
 
 	verifyBeforeCopy(): VerificationResult {
+		if (this.isProcessing || this.isScanStale) {
+			const warnings = [
+				'Scanning is incomplete for the current text. Wait for it to finish or edit the text to retry before copying.'
+			];
+			this.verificationWarnings = warnings;
+			return {
+				valid: false,
+				warnings
+			};
+		}
 		const result = verifySanitizedText(this.sanitizedText);
 		this.verificationWarnings = result.warnings;
 		return result;
