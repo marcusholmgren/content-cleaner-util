@@ -125,7 +125,6 @@ export class RedactorState {
 			if (seq === this.latestInputSeq) {
 				this.errorMessage = error instanceof Error ? error.message : 'Scanning failed';
 				console.error('Scanning failed', error);
-				this.isScanStale = false;
 			}
 		} finally {
 			if (seq === this.latestInputSeq) {
@@ -193,7 +192,9 @@ export class RedactorState {
 
 	verifyBeforeCopy(): VerificationResult {
 		if (this.isProcessing || this.isScanStale) {
-			const warnings = ['Scan in progress. Please wait for scanning to complete.'];
+			const warnings = [
+				'Scanning is incomplete for the current text. Wait for it to finish or edit the text to retry before copying.'
+			];
 			this.verificationWarnings = warnings;
 			return {
 				valid: false,
