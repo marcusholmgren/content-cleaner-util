@@ -142,18 +142,23 @@
 		editRuleValue = '';
 	}
 
-	async function copyRedacted() {
+	async function copyRedacted(forceOverride = false) {
+		if (!redactorState.canCopy) return;
+
 		const verification = redactorState.verifyBeforeCopy();
+		if (!verification.valid && !forceOverride) {
+			return;
+		}
+
 		if (typeof navigator !== 'undefined' && navigator.clipboard) {
 			await navigator.clipboard.writeText(redactorState.sanitizedText);
 		}
-		if (verification.valid) {
-			copied = true;
-			if (copyTimeout) clearTimeout(copyTimeout);
-			copyTimeout = setTimeout(() => {
-				copied = false;
-			}, 2000);
-		}
+
+		copied = true;
+		if (copyTimeout) clearTimeout(copyTimeout);
+		copyTimeout = setTimeout(() => {
+			copied = false;
+		}, 2000);
 	}
 
 	function getHighlightClass(entity: RedactionEntity): string {
@@ -212,8 +217,8 @@
 			<button
 				type="button"
 				class="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:opacity-50"
-				onclick={copyRedacted}
-				disabled={redactorState.rawText.length === 0}
+				onclick={() => copyRedacted(false)}
+				disabled={!redactorState.canCopy}
 			>
 				{copied ? 'Copied!' : 'Copy Redacted'}
 			</button>
@@ -252,13 +257,25 @@
 
 	{#if redactorState.verificationWarnings.length > 0}
 		<div
-			class="rounded border border-amber-400 bg-amber-50 p-3 text-sm text-amber-900"
+			class="flex flex-wrap items-center justify-between gap-3 rounded border border-amber-400 bg-amber-50 p-3 text-sm text-amber-900"
 			role="alert"
 			data-testid="verification-warning"
 		>
-			{#each redactorState.verificationWarnings as warning, i (i)}
-				<p class="font-medium">{warning}</p>
-			{/each}
+			<div class="flex flex-col gap-1">
+				{#each redactorState.verificationWarnings as warning, i (i)}
+					<p class="font-medium">{warning}</p>
+				{/each}
+			</div>
+			{#if redactorState.canCopy}
+				<button
+					type="button"
+					class="rounded bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-amber-800"
+					data-testid="copy-override-btn"
+					onclick={() => copyRedacted(true)}
+				>
+					Copy Anyway
+				</button>
+			{/if}
 		</div>
 	{/if}
 
