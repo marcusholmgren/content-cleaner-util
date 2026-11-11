@@ -315,6 +315,32 @@
 			placeholder="Paste your text here..."></textarea>
 	</div>
 
+	{#if redactorState.verificationReports.length > 0}
+		<div class="mt-3 flex flex-wrap gap-2" data-testid="verification-status-panel">
+			{#each redactorState.verificationReports as report (report.ruleId)}
+				<span
+					class="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium"
+					class:bg-green-50={report.status === 'NOT_DETECTED'}
+					class:text-green-700={report.status === 'NOT_DETECTED'}
+					class:border-green-200={report.status === 'NOT_DETECTED'}
+					class:bg-red-50={report.status === 'DETECTED'}
+					class:text-red-700={report.status === 'DETECTED'}
+					class:border-red-200={report.status === 'DETECTED'}
+					class:bg-yellow-50={report.status === 'INVALID_FORMAT'}
+					class:text-yellow-700={report.status === 'INVALID_FORMAT'}
+					class:border-yellow-200={report.status === 'INVALID_FORMAT'}
+				>
+					{#if report.status === 'NOT_DETECTED'}
+						✅
+					{:else}
+						❌
+					{/if}
+					&nbsp;{report.message}
+				</span>
+			{/each}
+		</div>
+	{/if}
+
 	{#if redactorState.entities.length > 0}
 		<div class="mt-1 flex flex-col gap-3">
 			<div>

@@ -128,7 +128,24 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 		}
 
 		// Stage 1a: Synchronous Deterministic Regex & High-Entropy Pass
+		const regexStartTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 		const regexEntities = RegexEngine.scan(text, config);
+		const regexDuration =
+			(typeof performance !== 'undefined' ? performance.now() : Date.now()) - regexStartTime;
+
+		const ssnMatches = regexEntities.filter((e) => e.type === 'SSN');
+		const verificationReports = [
+			{
+				ruleId: 'swedish-ssn-check',
+				status: ssnMatches.length > 0 ? 'DETECTED' : 'NOT_DETECTED',
+				matchesCount: ssnMatches.length,
+				executionTimeMs: Math.round(regexDuration),
+				message:
+					ssnMatches.length > 0
+						? `SSN Pattern Detected - ${ssnMatches.length} Masked`
+						: 'SSN Pattern Checked - 0 Found'
+			}
+		] as const;
 
 		// Stage 1b: User Custom Rules (Aho-Corasick + Pre-compiled SafeRegex)
 		const customEntities = customRuleEngine.scan(text, config);
@@ -186,6 +203,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 				type: 'SCAN_SUCCESS',
 				jobId,
 				entities: resolvedEntities,
+				verificationReports: [...verificationReports],
 				buffer,
 				runtimeDevice: activeDevice,
 				durationMs

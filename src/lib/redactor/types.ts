@@ -6,6 +6,7 @@ export type EntityType =
 	| 'TOKEN'
 	| 'IP'
 	| 'CREDIT_CARD'
+	| 'SSN'
 	| 'SUSPECTED_TOKEN'
 	| 'AMBIGUOUS_PER'
 	| 'AMBIGUOUS_ORG'
@@ -61,10 +62,19 @@ export interface ScanRequest {
 	config: ScanConfig;
 }
 
+export interface VerificationReport {
+	ruleId: string;
+	status: 'DETECTED' | 'NOT_DETECTED' | 'INVALID_FORMAT';
+	matchesCount: number;
+	executionTimeMs: number;
+	message: string;
+}
+
 export interface ScanResultPayload {
 	type: 'SCAN_SUCCESS';
 	jobId: number;
 	entities: RedactionEntity[];
+	verificationReports?: VerificationReport[];
 	buffer?: Int32Array;
 	runtimeDevice?: RuntimeDevice;
 	durationMs?: number;

@@ -6,7 +6,13 @@ import {
 	type VerificationResult
 } from './Engine';
 import { WorkerManager } from './WorkerManager';
-import type { CustomRule, EntityType, RedactionEntity, RuntimeDevice } from './types';
+import type {
+	CustomRule,
+	EntityType,
+	RedactionEntity,
+	RuntimeDevice,
+	VerificationReport
+} from './types';
 
 export class RedactorState {
 	rawText = $state('');
@@ -18,6 +24,7 @@ export class RedactorState {
 	runtimeDevice = $state<RuntimeDevice>('regex-only');
 	lastDurationMs = $state<number | null>(null);
 	verificationWarnings = $state<string[]>([]);
+	verificationReports = $state<VerificationReport[]>([]);
 	errorMessage = $state<string | null>(null);
 
 	workerManager: WorkerManager;
@@ -87,6 +94,7 @@ export class RedactorState {
 			this.isProcessing = false;
 			this.isScanStale = false;
 			this.lastDurationMs = null;
+			this.verificationReports = [];
 			return;
 		}
 
@@ -114,6 +122,7 @@ export class RedactorState {
 				this.lastJobId = result.jobId;
 				this.entities = result.entities ?? [];
 				this.isScanStale = false;
+				this.verificationReports = result.verificationReports ?? [];
 				if (result.runtimeDevice) {
 					this.runtimeDevice = result.runtimeDevice;
 				}

@@ -25,6 +25,7 @@ export const REDACTION_LABELS: Record<EntityType, string> = {
 	SUSPECTED_TOKEN: '[TOKEN]',
 	IP: '[IP]',
 	CREDIT_CARD: '[CREDIT_CARD]',
+	SSN: '[SSN]',
 	CUSTOM_RULE: '[CUSTOM]'
 };
 
@@ -36,6 +37,7 @@ const ENTITY_TYPE_TO_ENUM: Record<EntityType, number> = {
 	TOKEN: 5,
 	IP: 6,
 	CREDIT_CARD: 7,
+	SSN: 12,
 	SUSPECTED_TOKEN: 8,
 	AMBIGUOUS_PER: 9,
 	AMBIGUOUS_ORG: 10,
@@ -53,7 +55,8 @@ const ENUM_TO_ENTITY_TYPE: Record<number, EntityType> = {
 	8: 'SUSPECTED_TOKEN',
 	9: 'AMBIGUOUS_PER',
 	10: 'AMBIGUOUS_ORG',
-	11: 'CUSTOM_RULE'
+	11: 'CUSTOM_RULE',
+	12: 'SSN'
 };
 
 const AMBIGUOUS_PROPER_NOUNS = new Set([
@@ -442,6 +445,26 @@ export function isValidLuhn(raw: string): boolean {
 	return sum % 10 === 0;
 }
 
+export function isSwedishSSNValid(raw: string): boolean {
+	// e.g. YYMMDD-XXXX or YYYYMMDD-XXXX, sometimes with '+' instead of '-'
+	const digits = raw.replace(/\D/g, '');
+	if (digits.length !== 10 && digits.length !== 12) return false;
+	const ssn10 = digits.length === 12 ? digits.slice(2) : digits;
+
+	let sum = 0;
+	let shouldDouble = true; // For 10 digits, we double the first one (weights: 2 1 2 1 2 1 2 1 2)
+	for (let i = 0; i < ssn10.length; i++) {
+		let digit = ssn10.charCodeAt(i) - 48;
+		if (shouldDouble) {
+			digit *= 2;
+			if (digit > 9) digit -= 9;
+		}
+		sum += digit;
+		shouldDouble = !shouldDouble;
+	}
+	return sum % 10 === 0;
+}
+
 interface RegexRule {
 	type: EntityType;
 	rule: RegExp;
@@ -467,6 +490,11 @@ const REGEX_RULES: RegexRule[] = [
 		type: 'CREDIT_CARD',
 		rule: /\b(?:\d[ -]*?){13,19}\b/g,
 		validate: isValidLuhn
+	},
+	{
+		type: 'SSN',
+		rule: /\b(?:\d{2})?\d{6}[-+]?\d{4}\b/g,
+		validate: isSwedishSSNValid
 	}
 ];
 
