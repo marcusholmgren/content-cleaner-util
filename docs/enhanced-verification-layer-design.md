@@ -9,11 +9,11 @@
   The `ScanResultPayload` returned from the Worker (in `WorkerMessage/HostMessage`) must be expanded to include a new `VerificationReport` array.
   ```typescript
   export interface VerificationReport {
-	ruleId: string; // e.g., 'swedish-ssn-check'
-	status: 'DETECTED' | 'NOT_DETECTED' | 'INVALID_FORMAT';
-	matchesCount: number;
-	executionTimeMs: number;
-	message: string;
+  	ruleId: string; // e.g., 'swedish-ssn-check'
+  	status: 'DETECTED' | 'NOT_DETECTED' | 'INVALID_FORMAT';
+  	matchesCount: number;
+  	executionTimeMs: number;
+  	message: string;
   }
   ```
   The `ScanResultPayload` will include: `jobId`, `entities: RedactionEntity[]`, `verificationReports: VerificationReport[]`, `buffer?: Int32Array` (for zero-copy transfer), `runtimeDevice`, and `durationMs`.

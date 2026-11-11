@@ -3,6 +3,7 @@ import {
 	CustomRuleEngine,
 	DEFAULT_ENABLED_TYPES,
 	RegexEngine,
+	buildVerificationReports,
 	decodeEntitiesFromBuffer
 } from './Engine';
 import type {
@@ -136,25 +137,17 @@ export class WorkerManager {
 		if (!this.worker) {
 			const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 			const regexEntities = RegexEngine.scan(text, resolvedConfig);
-
 			const regexDuration =
 				(typeof performance !== 'undefined' ? performance.now() : Date.now()) - startTime;
-			const ssnMatches = regexEntities.filter((e) => e.type === 'SSN');
-			const verificationReports = [
-				{
-					ruleId: 'swedish-ssn-check',
-					status: ssnMatches.length > 0 ? 'DETECTED' : 'NOT_DETECTED',
-					matchesCount: ssnMatches.length,
-					executionTimeMs: Math.round(regexDuration),
-					message:
-						ssnMatches.length > 0
-							? `SSN Pattern Detected - ${ssnMatches.length} Masked`
-							: 'SSN Pattern Checked - 0 Found'
-				}
-			] as const;
 
 			const customEntities = this.fallbackCustomEngine.scan(text, resolvedConfig);
 			const entities = ConflictResolver.resolve([...regexEntities, ...customEntities]);
+			const verificationReports = buildVerificationReports(
+				text,
+				entities,
+				regexDuration,
+				resolvedConfig
+			);
 			const durationMs = Math.max(
 				0,
 				Math.round(
@@ -165,7 +158,7 @@ export class WorkerManager {
 				type: 'SCAN_SUCCESS',
 				jobId,
 				entities,
-				verificationReports: [...verificationReports],
+				verificationReports,
 				runtimeDevice: 'regex-only',
 				durationMs
 			};

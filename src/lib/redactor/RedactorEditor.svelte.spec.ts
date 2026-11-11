@@ -82,5 +82,27 @@ describe('RedactorEditor.svelte Custom Dictionary UI', () => {
 		// Should have copied with override
 		expect(copiedText).toBe('My SSN is 123-45-6789.');
 		await expect.element(copyBtn).toHaveTextContent('Copied!');
+		await expect.element(page.getByTestId('copy-disclaimer-toast')).toBeInTheDocument();
+	});
+
+	it('detects Swedish SSN, renders Verification Status Panel, and highlights SSN span on badge hover', async () => {
+		render(RedactorEditor);
+
+		const textarea = page.getByPlaceholder('Paste your text here...');
+		await textarea.fill('Personal ID: 811218-9876');
+
+		const statusPanel = page.getByTestId('verification-status-panel');
+		await expect.element(statusPanel).toBeInTheDocument();
+
+		const badge = page.getByTestId('verification-report-badge');
+		await expect.element(badge).toHaveTextContent('SSN Pattern Detected - 1 Masked');
+
+		const sanitizedPreview = page.getByTestId('sanitized-preview');
+		await expect.element(sanitizedPreview).toHaveTextContent('Personal ID: [SSN]');
+
+		// Hovering over the verification badge highlights the SSN span in the twin-layer overlay
+		await badge.hover();
+		const highlightSpan = page.getByTestId('highlight-layer').getByText('811218-9876');
+		await expect.element(highlightSpan).toHaveAttribute('data-verification-highlighted', 'true');
 	});
 });

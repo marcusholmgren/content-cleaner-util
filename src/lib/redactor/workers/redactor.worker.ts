@@ -3,6 +3,7 @@ import {
 	RegexEngine,
 	CustomRuleEngine,
 	ConflictResolver,
+	buildVerificationReports,
 	createZeroMaskedBuffer,
 	splitIntoChunks,
 	shouldSkipChunk,
@@ -118,6 +119,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 					type: 'SCAN_SUCCESS',
 					jobId,
 					entities: [],
+					verificationReports: [],
 					buffer: emptyBuffer,
 					runtimeDevice: activeDevice,
 					durationMs: 0
@@ -132,20 +134,6 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 		const regexEntities = RegexEngine.scan(text, config);
 		const regexDuration =
 			(typeof performance !== 'undefined' ? performance.now() : Date.now()) - regexStartTime;
-
-		const ssnMatches = regexEntities.filter((e) => e.type === 'SSN');
-		const verificationReports = [
-			{
-				ruleId: 'swedish-ssn-check',
-				status: ssnMatches.length > 0 ? 'DETECTED' : 'NOT_DETECTED',
-				matchesCount: ssnMatches.length,
-				executionTimeMs: Math.round(regexDuration),
-				message:
-					ssnMatches.length > 0
-						? `SSN Pattern Detected - ${ssnMatches.length} Masked`
-						: 'SSN Pattern Checked - 0 Found'
-			}
-		] as const;
 
 		// Stage 1b: User Custom Rules (Aho-Corasick + Pre-compiled SafeRegex)
 		const customEntities = customRuleEngine.scan(text, config);
@@ -192,6 +180,12 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 			...customEntities,
 			...nerEntities
 		]);
+		const verificationReports = buildVerificationReports(
+			text,
+			resolvedEntities,
+			regexDuration,
+			config
+		);
 		const buffer = encodeEntitiesToBuffer(resolvedEntities);
 		const durationMs = Math.max(
 			0,
@@ -203,7 +197,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 				type: 'SCAN_SUCCESS',
 				jobId,
 				entities: resolvedEntities,
-				verificationReports: [...verificationReports],
+				verificationReports,
 				buffer,
 				runtimeDevice: activeDevice,
 				durationMs
