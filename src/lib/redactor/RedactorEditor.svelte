@@ -11,7 +11,9 @@
 	let scrollTop = $state(0);
 	let viewportHeight = $state(256);
 	let copied = $state(false);
+	let showCopyDisclaimerToast = $state(false);
 	let copyTimeout: ReturnType<typeof setTimeout> | null = null;
+	let toastTimeout: ReturnType<typeof setTimeout> | null = null;
 
 	// Custom Rule Builder form state
 	let newRuleType: CustomRuleType = $state('PHRASE');
@@ -25,8 +27,13 @@
 	let editRuleValue = $state('');
 	let editRuleError: string | null = $state(null);
 
-	// Tooltip inspector state
+	// Tooltip inspector & verification badge hover state
 	let inspectedEntityIndex: number | null = $state(null);
+	let hoveredReportRuleId: string | null = $state(null);
+
+	const RULE_ID_TO_ENTITY_TYPE: Record<string, EntityType> = {
+		'swedish-ssn-check': 'SSN'
+	};
 
 	const FILTERABLE_TYPES: Array<{ type: EntityType; label: string }> = [
 		{ type: 'PER', label: 'Names (PER)' },
@@ -36,6 +43,7 @@
 		{ type: 'IP', label: 'IP Addresses' },
 		{ type: 'TOKEN', label: 'Tokens & Secrets' },
 		{ type: 'CREDIT_CARD', label: 'Credit Cards' },
+		{ type: 'SSN', label: 'SSNs' },
 		{ type: 'CUSTOM_RULE', label: 'Custom Dictionary' }
 	];
 
@@ -49,6 +57,18 @@
 
 	const inspectedEntity = $derived(
 		inspectedEntityIndex !== null ? (redactorState.entities[inspectedEntityIndex] ?? null) : null
+	);
+
+	const highlightedEntityType = $derived(
+		hoveredReportRuleId ? (RULE_ID_TO_ENTITY_TYPE[hoveredReportRuleId] ?? null) : null
+	);
+
+	const verificationBadges = $derived(
+		redactorState.verificationReports.map((report) => ({
+			...report,
+			icon:
+				report.status === 'NOT_DETECTED' ? '✅' : report.status === 'INVALID_FORMAT' ? '⚠️' : '❌'
+		}))
 	);
 
 	onMount(() => {
@@ -155,36 +175,43 @@
 		}
 
 		copied = true;
+		showCopyDisclaimerToast = true;
 		if (copyTimeout) clearTimeout(copyTimeout);
 		copyTimeout = setTimeout(() => {
 			copied = false;
 		}, 2000);
+		if (toastTimeout) clearTimeout(toastTimeout);
+		toastTimeout = setTimeout(() => {
+			showCopyDisclaimerToast = false;
+		}, 5000);
 	}
 
-	function getHighlightClass(entity: RedactionEntity): string {
+	function getHighlightClass(entity: RedactionEntity, isVerificationHighlighted = false): string {
 		const isAmbiguous =
 			entity.ambiguous || entity.type === 'AMBIGUOUS_PER' || entity.type === 'AMBIGUOUS_ORG';
 
+		const emphasis = isVerificationHighlighted ? ' ring-2 ring-red-600 bg-red-300/90' : '';
+
 		if (isAmbiguous) {
 			if (entity.redacted) {
-				return 'bg-yellow-200/80 underline decoration-yellow-500 decoration-dotted decoration-2 rounded-xs';
+				return `bg-yellow-200/80 underline decoration-yellow-500 decoration-dotted decoration-2 rounded-xs${emphasis}`;
 			}
-			return 'underline decoration-yellow-500 decoration-dotted decoration-2 rounded-xs';
+			return `underline decoration-yellow-500 decoration-dotted decoration-2 rounded-xs${emphasis}`;
 		}
 
 		if (entity.redacted === false) {
-			return 'underline decoration-gray-400 decoration-dotted rounded-xs';
+			return `underline decoration-gray-400 decoration-dotted rounded-xs${emphasis}`;
 		}
 
 		if (entity.source === 'CUSTOM' || entity.type === 'CUSTOM_RULE') {
-			return 'bg-purple-200/75 underline decoration-purple-600 decoration-dashed decoration-2 rounded-xs';
+			return `bg-purple-200/75 underline decoration-purple-600 decoration-dashed decoration-2 rounded-xs${emphasis}`;
 		}
 
 		if (entity.source === 'REGEX') {
-			return 'bg-red-200/75 rounded-xs';
+			return `bg-red-200/75 rounded-xs${emphasis}`;
 		}
 
-		return 'bg-yellow-200/80 rounded-xs';
+		return `bg-yellow-200/80 rounded-xs${emphasis}`;
 	}
 
 	function getEntityInspectorLabel(entity: RedactionEntity): string {
@@ -200,6 +227,7 @@
 
 	onDestroy(() => {
 		if (copyTimeout) clearTimeout(copyTimeout);
+		if (toastTimeout) clearTimeout(toastTimeout);
 		redactorState.destroy();
 	});
 </script>
@@ -285,6 +313,29 @@
 		</div>
 	{/if}
 
+	{#if showCopyDisclaimerToast}
+		<div
+			class="flex items-center justify-between gap-3 rounded border border-slate-700 bg-slate-900 px-4 py-2.5 text-xs font-medium text-white shadow-sm"
+			role="status"
+			aria-live="polite"
+			data-testid="copy-disclaimer-toast"
+		>
+			<span>
+				Data copied to clipboard. Disclaimer: Automated verification is not a guarantee against all
+				PII leaks. Please review manually.
+			</span>
+			<button
+				type="button"
+				class="text-slate-300 transition hover:text-white"
+				onclick={() => {
+					showCopyDisclaimerToast = false;
+				}}
+			>
+				Dismiss
+			</button>
+		</div>
+	{/if}
+
 	<!-- Twin-Layer Synchronized Editor -->
 	<div class="relative h-64 w-full overflow-hidden rounded border border-gray-300 bg-white">
 		<!-- Highlight Layer -->
@@ -295,12 +346,17 @@
 			data-testid="highlight-layer"
 		>
 			{#each highlightSegments as segment, i (i)}{#if segment.entity}<span
-						class="{getHighlightClass(segment.entity)} text-transparent"
+						class="{getHighlightClass(
+							segment.entity,
+							highlightedEntityType === segment.entity.type
+						)} text-transparent"
 						data-entity-type={segment.entity.type}
 						data-entity-source={segment.entity.source}
 						data-ambiguous={segment.entity.ambiguous ? 'true' : undefined}
 						data-redacted={segment.entity.redacted !== false ? 'true' : 'false'}
-						>{segment.text}</span
+						data-verification-highlighted={highlightedEntityType === segment.entity.type
+							? 'true'
+							: undefined}>{segment.text}</span
 					>{:else}{segment.text}{/if}{/each}{#if redactorState.rawText.endsWith('\n')}<br />{/if}
 		</div>
 
@@ -314,6 +370,39 @@
 			onclick={handleTextareaClick}
 			placeholder="Paste your text here..."></textarea>
 	</div>
+
+	{#if verificationBadges.length > 0}
+		<div class="mt-3 flex flex-wrap gap-2" data-testid="verification-status-panel">
+			{#each verificationBadges as report (report.ruleId)}
+				<span
+					role="status"
+					data-testid="verification-report-badge"
+					data-rule-id={report.ruleId}
+					data-report-status={report.status}
+					onmouseenter={() => {
+						hoveredReportRuleId = report.ruleId;
+					}}
+					onmouseleave={() => {
+						if (hoveredReportRuleId === report.ruleId) {
+							hoveredReportRuleId = null;
+						}
+					}}
+					class="inline-flex cursor-default items-center rounded-full border px-2.5 py-0.5 text-xs font-medium transition"
+					class:bg-green-50={report.status === 'NOT_DETECTED'}
+					class:text-green-700={report.status === 'NOT_DETECTED'}
+					class:border-green-200={report.status === 'NOT_DETECTED'}
+					class:bg-red-50={report.status === 'DETECTED'}
+					class:text-red-700={report.status === 'DETECTED'}
+					class:border-red-200={report.status === 'DETECTED'}
+					class:bg-yellow-50={report.status === 'INVALID_FORMAT'}
+					class:text-yellow-700={report.status === 'INVALID_FORMAT'}
+					class:border-yellow-200={report.status === 'INVALID_FORMAT'}
+				>
+					{report.icon}&nbsp;{report.message}
+				</span>
+			{/each}
+		</div>
+	{/if}
 
 	{#if redactorState.entities.length > 0}
 		<div class="mt-1 flex flex-col gap-3">
@@ -611,4 +700,8 @@
 			</div>
 		{/if}
 	</section>
+
+	<footer class="mt-1 text-center text-xs text-gray-500" data-testid="assistive-tool-disclaimer">
+		Auto-redaction is an assistive tool.
+	</footer>
 </div>

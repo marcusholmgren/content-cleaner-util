@@ -3,6 +3,7 @@ import {
 	RegexEngine,
 	CustomRuleEngine,
 	ConflictResolver,
+	buildVerificationReports,
 	createZeroMaskedBuffer,
 	splitIntoChunks,
 	shouldSkipChunk,
@@ -118,6 +119,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 					type: 'SCAN_SUCCESS',
 					jobId,
 					entities: [],
+					verificationReports: [],
 					buffer: emptyBuffer,
 					runtimeDevice: activeDevice,
 					durationMs: 0
@@ -128,7 +130,10 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 		}
 
 		// Stage 1a: Synchronous Deterministic Regex & High-Entropy Pass
+		const regexStartTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 		const regexEntities = RegexEngine.scan(text, config);
+		const regexDuration =
+			(typeof performance !== 'undefined' ? performance.now() : Date.now()) - regexStartTime;
 
 		// Stage 1b: User Custom Rules (Aho-Corasick + Pre-compiled SafeRegex)
 		const customEntities = customRuleEngine.scan(text, config);
@@ -175,6 +180,12 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 			...customEntities,
 			...nerEntities
 		]);
+		const verificationReports = buildVerificationReports(
+			text,
+			resolvedEntities,
+			regexDuration,
+			config
+		);
 		const buffer = encodeEntitiesToBuffer(resolvedEntities);
 		const durationMs = Math.max(
 			0,
@@ -186,6 +197,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 				type: 'SCAN_SUCCESS',
 				jobId,
 				entities: resolvedEntities,
+				verificationReports,
 				buffer,
 				runtimeDevice: activeDevice,
 				durationMs

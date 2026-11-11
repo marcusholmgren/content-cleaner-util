@@ -3,6 +3,7 @@ import {
 	CustomRuleEngine,
 	DEFAULT_ENABLED_TYPES,
 	RegexEngine,
+	buildVerificationReports,
 	decodeEntitiesFromBuffer
 } from './Engine';
 import type {
@@ -136,8 +137,17 @@ export class WorkerManager {
 		if (!this.worker) {
 			const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 			const regexEntities = RegexEngine.scan(text, resolvedConfig);
+			const regexDuration =
+				(typeof performance !== 'undefined' ? performance.now() : Date.now()) - startTime;
+
 			const customEntities = this.fallbackCustomEngine.scan(text, resolvedConfig);
 			const entities = ConflictResolver.resolve([...regexEntities, ...customEntities]);
+			const verificationReports = buildVerificationReports(
+				text,
+				entities,
+				regexDuration,
+				resolvedConfig
+			);
 			const durationMs = Math.max(
 				0,
 				Math.round(
@@ -148,6 +158,7 @@ export class WorkerManager {
 				type: 'SCAN_SUCCESS',
 				jobId,
 				entities,
+				verificationReports,
 				runtimeDevice: 'regex-only',
 				durationMs
 			};

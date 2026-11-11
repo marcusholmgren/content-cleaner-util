@@ -2,16 +2,19 @@ import { describe, expect, it } from 'vitest';
 import {
 	ConflictResolver,
 	CustomRuleEngine,
+	DEFAULT_ENABLED_TYPES,
 	RegexEngine,
 	alignAndNormalizeNerTokens,
 	applyRedactions,
 	buildHighlightSegments,
+	buildVerificationReports,
 	calculateShannonEntropy,
 	clampToWordBoundaries,
 	createZeroMaskedBuffer,
 	decodeEntitiesFromBuffer,
 	encodeEntitiesToBuffer,
 	getViewportCharRange,
+	isSwedishSSNValid,
 	shouldSkipChunk,
 	splitIntoChunks,
 	validateCustomRule,
@@ -42,6 +45,70 @@ describe('RegexEngine & Shannon Entropy', () => {
 		expect(entities).toHaveLength(1);
 		expect(entities[0].type).toBe('SUSPECTED_TOKEN');
 		expect(text.slice(entities[0].start, entities[0].end)).toBe(secret);
+	});
+
+	it('validates and detects Swedish SSNs (10-digit, 12-digit, + separator, samordningsnummer) and rejects invalid checksums or dates', () => {
+		expect(DEFAULT_ENABLED_TYPES).toContain('SSN');
+		expect(isSwedishSSNValid('811218-9876')).toBe(true);
+		expect(isSwedishSSNValid('19811218-9876')).toBe(true);
+		expect(isSwedishSSNValid('811218+9876')).toBe(true);
+		expect(isSwedishSSNValid('8112189876')).toBe(true);
+		expect(isSwedishSSNValid('19811278-9873')).toBe(true); // Samordningsnummer (day 18 + 60 = 78)
+
+		// Invalid checksum, invalid month/day, or all-zeros
+		expect(isSwedishSSNValid('811218-9877')).toBe(false);
+		expect(isSwedishSSNValid('811318-9874')).toBe(false);
+		expect(isSwedishSSNValid('000000-0000')).toBe(false);
+		expect(isSwedishSSNValid('0000000000')).toBe(false);
+
+		const text = 'Swedish SSNs: 811218-9876 and 19811218+9876, invalid 811218-9877.';
+		const entities = RegexEngine.scan(text, { enabledTypes: DEFAULT_ENABLED_TYPES });
+		expect(entities).toHaveLength(2);
+		expect(entities.map((e) => e.type)).toEqual(['SSN', 'SSN']);
+		expect(applyRedactions(text, entities)).toBe(
+			'Swedish SSNs: [SSN] and [SSN], invalid 811218-9877.'
+		);
+	});
+
+	it('builds VerificationReport for DETECTED, NOT_DETECTED, and INVALID_FORMAT states', () => {
+		const detectedText = 'Customer SSN 811218-9876 and 19811218-9876.';
+		const detectedEntities = RegexEngine.scan(detectedText);
+		const detectedReports = buildVerificationReports(detectedText, detectedEntities, 2.4);
+		expect(detectedReports).toEqual([
+			{
+				ruleId: 'swedish-ssn-check',
+				status: 'DETECTED',
+				matchesCount: 2,
+				executionTimeMs: 2,
+				message: 'SSN Pattern Detected - 2 Masked'
+			}
+		]);
+
+		const invalidText = 'Malformed SSN candidate 811218-9877 in text.';
+		const invalidEntities = RegexEngine.scan(invalidText);
+		const invalidReports = buildVerificationReports(invalidText, invalidEntities, 1.2);
+		expect(invalidReports).toEqual([
+			{
+				ruleId: 'swedish-ssn-check',
+				status: 'INVALID_FORMAT',
+				matchesCount: 0,
+				executionTimeMs: 1,
+				message: 'SSN Pattern Invalid Format - Checksum Failed'
+			}
+		]);
+
+		const cleanText = 'Hello world with no SSN candidates.';
+		const cleanEntities = RegexEngine.scan(cleanText);
+		const cleanReports = buildVerificationReports(cleanText, cleanEntities, 0.8);
+		expect(cleanReports).toEqual([
+			{
+				ruleId: 'swedish-ssn-check',
+				status: 'NOT_DETECTED',
+				matchesCount: 0,
+				executionTimeMs: 1,
+				message: 'SSN Pattern Checked - 0 Found'
+			}
+		]);
 	});
 });
 
@@ -214,9 +281,17 @@ describe('Int32Array Buffer Transfer, Verification & Viewport Virtualization', (
 				redacted: true
 			},
 			{
+				type: 'SSN' as const,
+				start: 16,
+				end: 27,
+				source: 'REGEX' as const,
+				confidence: 1,
+				redacted: true
+			},
+			{
 				type: 'AMBIGUOUS_ORG' as const,
-				start: 20,
-				end: 25,
+				start: 30,
+				end: 35,
 				source: 'NER' as const,
 				confidence: 0.55,
 				ambiguous: true,
@@ -234,7 +309,11 @@ describe('Int32Array Buffer Transfer, Verification & Viewport Virtualization', (
 		expect(unsafeResult.valid).toBe(false);
 		expect(unsafeResult.warnings).toContain('Potential unmasked SSN detected.');
 
-		const safeResult = verifySanitizedText('User [NAME] logged in from [IP].');
+		const unsafeSwedishResult = verifySanitizedText('User [NAME] has SSN 811218-9876 on file.');
+		expect(unsafeSwedishResult.valid).toBe(false);
+		expect(unsafeSwedishResult.warnings).toContain('Potential unmasked SSN detected.');
+
+		const safeResult = verifySanitizedText('User [NAME] logged in from [IP] with [SSN].');
 		expect(safeResult.valid).toBe(true);
 		expect(safeResult.warnings).toHaveLength(0);
 	});

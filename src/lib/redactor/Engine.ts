@@ -1,4 +1,11 @@
-import type { CustomRule, CustomRuleType, EntityType, RedactionEntity, ScanConfig } from './types';
+import type {
+	CustomRule,
+	CustomRuleType,
+	EntityType,
+	RedactionEntity,
+	ScanConfig,
+	VerificationReport
+} from './types';
 
 export const DEFAULT_ENABLED_TYPES: EntityType[] = [
 	'PER',
@@ -8,6 +15,7 @@ export const DEFAULT_ENABLED_TYPES: EntityType[] = [
 	'TOKEN',
 	'IP',
 	'CREDIT_CARD',
+	'SSN',
 	'SUSPECTED_TOKEN',
 	'AMBIGUOUS_PER',
 	'AMBIGUOUS_ORG',
@@ -25,6 +33,7 @@ export const REDACTION_LABELS: Record<EntityType, string> = {
 	SUSPECTED_TOKEN: '[TOKEN]',
 	IP: '[IP]',
 	CREDIT_CARD: '[CREDIT_CARD]',
+	SSN: '[SSN]',
 	CUSTOM_RULE: '[CUSTOM]'
 };
 
@@ -36,6 +45,7 @@ const ENTITY_TYPE_TO_ENUM: Record<EntityType, number> = {
 	TOKEN: 5,
 	IP: 6,
 	CREDIT_CARD: 7,
+	SSN: 12,
 	SUSPECTED_TOKEN: 8,
 	AMBIGUOUS_PER: 9,
 	AMBIGUOUS_ORG: 10,
@@ -53,7 +63,8 @@ const ENUM_TO_ENTITY_TYPE: Record<number, EntityType> = {
 	8: 'SUSPECTED_TOKEN',
 	9: 'AMBIGUOUS_PER',
 	10: 'AMBIGUOUS_ORG',
-	11: 'CUSTOM_RULE'
+	11: 'CUSTOM_RULE',
+	12: 'SSN'
 };
 
 const AMBIGUOUS_PROPER_NOUNS = new Set([
@@ -362,7 +373,8 @@ export class CustomRuleEngine {
 		}
 
 		for (const entry of this.compiledRegexes) {
-			const regex = new RegExp(entry.regex.source, entry.regex.flags);
+			const regex = entry.regex;
+			regex.lastIndex = 0;
 			const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 			let match: RegExpExecArray | null;
 			let iterations = 0;
@@ -442,6 +454,47 @@ export function isValidLuhn(raw: string): boolean {
 	return sum % 10 === 0;
 }
 
+export function isSwedishSSNValid(raw: string): boolean {
+	// e.g. YYMMDD-XXXX or YYYYMMDD-XXXX, sometimes with '+' instead of '-'
+	const digits = raw.replace(/\D/g, '');
+	if (digits.length !== 10 && digits.length !== 12) return false;
+
+	if (digits.length === 12) {
+		const century = Number(digits.slice(0, 2));
+		if (century !== 18 && century !== 19 && century !== 20) return false;
+	}
+
+	const ssn10 = digits.length === 12 ? digits.slice(2) : digits;
+	const year = Number(ssn10.slice(0, 2));
+	const month = Number(ssn10.slice(2, 4));
+	const rawDay = Number(ssn10.slice(4, 6));
+
+	if (month < 1 || month > 12) return false;
+
+	// Swedish coordination numbers (samordningsnummer) add 60 to the calendar day
+	const day = rawDay > 60 ? rawDay - 60 : rawDay;
+	const fullYear = digits.length === 12 ? Number(digits.slice(0, 4)) : 2000 + year;
+	const isLeapYear = (fullYear % 4 === 0 && fullYear % 100 !== 0) || fullYear % 400 === 0;
+	const daysInMonths = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+	if (day < 1 || day > daysInMonths[month - 1]) return false;
+
+	let sum = 0;
+	let shouldDouble = true; // For 10 digits, we double the first one (weights: 2 1 2 1 2 1 2 1 2 1)
+	for (let i = 0; i < ssn10.length; i++) {
+		let digit = ssn10.charCodeAt(i) - 48;
+		if (shouldDouble) {
+			digit *= 2;
+			if (digit > 9) digit -= 9;
+		}
+		sum += digit;
+		shouldDouble = !shouldDouble;
+	}
+	return sum % 10 === 0;
+}
+
+const SWEDISH_SSN_REGEX = new RegExp('\\b(?:\\d{2})?\\d{6}[-+]?\\d{4}\\b', 'g');
+const SWEDISH_SSN_EXPLICIT_FORMAT_REGEX = new RegExp('\\b(?:\\d{2})?\\d{6}[-+]\\d{4}\\b', 'g');
+
 interface RegexRule {
 	type: EntityType;
 	rule: RegExp;
@@ -467,6 +520,11 @@ const REGEX_RULES: RegexRule[] = [
 		type: 'CREDIT_CARD',
 		rule: /\b(?:\d[ -]*?){13,19}\b/g,
 		validate: isValidLuhn
+	},
+	{
+		type: 'SSN',
+		rule: SWEDISH_SSN_REGEX,
+		validate: isSwedishSSNValid
 	}
 ];
 
@@ -491,20 +549,34 @@ export class RegexEngine {
 		for (const { type, rule, validate } of REGEX_RULES) {
 			if (!isTypeEnabled(type, enabledTypes)) continue;
 
-			const regex = new RegExp(rule.source, rule.flags);
+			rule.lastIndex = 0;
+			const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 			let match: RegExpExecArray | null;
-			while ((match = regex.exec(text)) !== null) {
-				const rawMatch = match[0];
-				if (validate && !validate(rawMatch)) continue;
+			let iterations = 0;
 
-				entities.push({
-					type,
-					start: match.index,
-					end: match.index + rawMatch.length,
-					source: 'REGEX',
-					confidence: 1.0,
-					redacted: true
-				});
+			while ((match = rule.exec(text)) !== null) {
+				const rawMatch = match[0];
+				if (rawMatch.length === 0) {
+					rule.lastIndex++;
+					continue;
+				}
+				if (!validate || validate(rawMatch)) {
+					entities.push({
+						type,
+						start: match.index,
+						end: match.index + rawMatch.length,
+						source: 'REGEX',
+						confidence: 1.0,
+						redacted: true
+					});
+				}
+
+				iterations++;
+				// Guard against excessive execution time (> 5ms budget per pattern check)
+				const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+				if (now - startTime > 5 || iterations > 5000) {
+					break;
+				}
 			}
 		}
 
@@ -1097,10 +1169,85 @@ export interface VerificationResult {
 
 const RESIDUAL_SSN_REGEX = /\b\d{3}-\d{2}-\d{4}\b/;
 
+export function buildVerificationReports(
+	text: string,
+	entities: RedactionEntity[],
+	executionTimeMs: number,
+	config?: Partial<ScanConfig>
+): VerificationReport[] {
+	if (!text || !text.trim()) return [];
+	if (!isTypeEnabled('SSN', config?.enabledTypes)) return [];
+
+	const ssnMatches = entities.filter((e) => e.type === 'SSN');
+	const boundedTimeMs = Math.max(0, Math.round(executionTimeMs));
+
+	if (ssnMatches.length > 0) {
+		return [
+			{
+				ruleId: 'swedish-ssn-check',
+				status: 'DETECTED',
+				matchesCount: ssnMatches.length,
+				executionTimeMs: boundedTimeMs,
+				message: `SSN Pattern Detected - ${ssnMatches.length} Masked`
+			}
+		];
+	}
+
+	SWEDISH_SSN_EXPLICIT_FORMAT_REGEX.lastIndex = 0;
+	const checkStart = typeof performance !== 'undefined' ? performance.now() : Date.now();
+	let candidateMatch: RegExpExecArray | null;
+	let hasInvalidFormatCandidate = false;
+	let iterations = 0;
+
+	while ((candidateMatch = SWEDISH_SSN_EXPLICIT_FORMAT_REGEX.exec(text)) !== null) {
+		if (!isSwedishSSNValid(candidateMatch[0])) {
+			hasInvalidFormatCandidate = true;
+			break;
+		}
+		iterations++;
+		const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+		if (now - checkStart > 5 || iterations > 5000) {
+			break;
+		}
+	}
+
+	if (hasInvalidFormatCandidate) {
+		return [
+			{
+				ruleId: 'swedish-ssn-check',
+				status: 'INVALID_FORMAT',
+				matchesCount: 0,
+				executionTimeMs: boundedTimeMs,
+				message: 'SSN Pattern Invalid Format - Checksum Failed'
+			}
+		];
+	}
+
+	return [
+		{
+			ruleId: 'swedish-ssn-check',
+			status: 'NOT_DETECTED',
+			matchesCount: 0,
+			executionTimeMs: boundedTimeMs,
+			message: 'SSN Pattern Checked - 0 Found'
+		}
+	];
+}
+
 export function verifySanitizedText(sanitizedText: string): VerificationResult {
 	const warnings: string[] = [];
 
-	if (RESIDUAL_SSN_REGEX.test(sanitizedText)) {
+	let hasResidualSwedishSsn = false;
+	SWEDISH_SSN_REGEX.lastIndex = 0;
+	let match: RegExpExecArray | null;
+	while ((match = SWEDISH_SSN_REGEX.exec(sanitizedText)) !== null) {
+		if (isSwedishSSNValid(match[0])) {
+			hasResidualSwedishSsn = true;
+			break;
+		}
+	}
+
+	if (RESIDUAL_SSN_REGEX.test(sanitizedText) || hasResidualSwedishSsn) {
 		warnings.push('Potential unmasked SSN detected.');
 	}
 

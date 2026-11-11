@@ -26,4 +26,31 @@ describe('RedactorState copy safety', () => {
 
 		state.destroy();
 	});
+
+	it('populates verificationReports and redacts Swedish SSNs by default', async () => {
+		vi.useFakeTimers();
+		const workerManager = new WorkerManager();
+		// Force synchronous regex fallback path for deterministic testing
+		workerManager.worker?.terminate();
+		workerManager.worker = null;
+
+		const state = new RedactorState(workerManager);
+		state.handleInput('Applicant SSN: 811218-9876');
+
+		await vi.advanceTimersByTimeAsync(120);
+
+		expect(state.sanitizedText).toBe('Applicant SSN: [SSN]');
+		expect(state.verificationReports).toHaveLength(1);
+		expect(state.verificationReports[0]).toMatchObject({
+			ruleId: 'swedish-ssn-check',
+			status: 'DETECTED',
+			matchesCount: 1,
+			message: 'SSN Pattern Detected - 1 Masked'
+		});
+
+		state.handleInput('');
+		expect(state.verificationReports).toEqual([]);
+
+		state.destroy();
+	});
 });
